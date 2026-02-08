@@ -4,197 +4,296 @@ import logging
 import uuid
 import requests
 import warnings
+import shutil
 from datetime import datetime
 from collections import deque
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 
-# 將 Nextcord 替換為 Disnake
 import disnake
 from disnake.ext import commands, tasks
-from disnake import Embed, ApplicationCommandInteraction
+from disnake import Embed, ApplicationCommandInteraction, ButtonStyle
+from disnake.ui import View, Button
 from qdrant_client import QdrantClient, models
 from yt_dlp import YoutubeDL
-import spotipy
-from spotipy.oauth2 import SpotifyClientCredentials
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 
-# --- 0. 系統初始化 ---
+# --- 0. 配置與初始化 ---
 load_dotenv()
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(name)s: %(message)s')
 logger = logging.getLogger("MegaBot")
 
-# --- 1. 全域配置 ---
+FFMPEG_PATH = shutil.which(os.getenv('FFMPEG_PATH', 'ffmpeg')) or 'ffmpeg'
+
 CONFIG = {
     "TOKEN": os.getenv('DISCORD_BOT_TOKEN'),
-    "FFMPEG": os.getenv('FFMPEG_PATH', 'ffmpeg'),
     "QDRANT": os.getenv('QDRANT_URL', "http://localhost:6333"),
     "EMBED_API": "https://ws-04.wade0426.me/embed",
     "LLM_API": "https://ws-02.wade0426.me/v1",
-    "MEMORY_COLLECTION": "mega_bot_memory_v2026_final",
+    "CHAT_COL": "mega_chat_v2026",
+    "MUSIC_COL": "mega_music_v2026"
 }
 
+# 強制選取第一條流 (-map 0:a:0) 確保原始音訊輸出
 FFMPEG_OPTS = {
-    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
-    'options': '-vn',
+    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -probesize 10M -analyzeduration 10M',
+    'options': '-vn -loglevel panic -map 0:a:0',
 }
 
-# --- 2. 外部服務初始化 ---
+# --- 1. 精確化提示詞庫 ---
+class PromptLibrary:
+    @staticmethod
+    def get_music_refine_prompt(user_query: str):
+        return f"""[TASK] Convert user music request into ONE precise search keyword for YouTube.
+[RULE] Output ONLY the keyword. No explanations. No quotes.
+[USER REQUEST] {user_query}
+[OUTPUT]"""
+
+    @staticmethod
+    def get_dj_commentary_prompt(track_title: str):
+        return f"""[ROLE] You are MegaBot DJ, a futuristic AI.
+[TASK] Write a 15-word cool intro for: {track_title}.
+[STYLE] Cyberpunk, professional, direct. No greetings.
+[OUTPUT]"""
+
+    @staticmethod
+    def get_chat_system_prompt(context: str):
+        return f"""[ROLE] MegaBot 2026 AI.
+[CONTEXT] {context}
+[INSTRUCTION] Answer concisely based on memory. Be professional yet witty."""
+
+# --- 2. 服務管理員 ---
 class ServiceManager:
     def __init__(self):
-        self.ytdl = YoutubeDL({'format': 'bestaudio/best', 'quiet': True, 'no_warnings': True})
+        # 音軌邏輯：移除特定語言偏好，改為 format_sort 優先原始音軌
+        self.ytdl = YoutubeDL({
+            'format': 'bestaudio/best',
+            'quiet': True,
+            'no_warnings': True,
+            'default_search': 'ytsearch',
+            'extract_flat': False,
+            'nocheckcertificate': True,
+            'ignoreerrors': True,
+            'format_sort': ['hasaud', 'ext', 'downloader_key'], # 優先考慮原始串流品質
+        })
         self.qdrant = QdrantClient(url=CONFIG["QDRANT"])
+        
+        # LLM 設定改為指定格式，temperature 設為 0
         self.llm = ChatOpenAI(
-            base_url=CONFIG["LLM_API"],
-            api_key="none",
-            model="google/gemma-3-27b-it",
+            base_url=CONFIG["LLM_API"], 
+            api_key="none", 
+            model="google/gemma-3-27b-it", 
             temperature=0
         )
+        self.vector_dim = None
+
+    async def probe_and_init(self):
         try:
-            auth = SpotifyClientCredentials(
-                client_id=os.getenv('SPOTIPY_CLIENT_ID'), 
-                client_secret=os.getenv('SPOTIPY_CLIENT_SECRET')
-            )
-            self.spotify = spotipy.Spotify(auth_manager=auth)
-        except: self.spotify = None
+            r = await asyncio.to_thread(requests.post, CONFIG["EMBED_API"], json={"texts": ["init"], "normalize": True}, timeout=5)
+            self.vector_dim = len(r.json()['embeddings'][0])
+        except Exception as e:
+            logger.warning(f"Embedding API 異常: {e}")
+            self.vector_dim = 4096
+            
+        for col in [CONFIG["CHAT_COL"], CONFIG["MUSIC_COL"]]:
+            try:
+                self.qdrant.get_collection(col)
+            except:
+                self.qdrant.create_collection(col, models.VectorParams(size=self.vector_dim, distance=models.Distance.COSINE))
 
 services = ServiceManager()
 
-# --- 3. 語音與播放隊列狀態 ---
+# --- 3. 機器人核心組件 ---
+class MusicView(View):
+    def __init__(self, bot, gid):
+        super().__init__(timeout=None)
+        self.bot, self.gid = bot, gid
+
+    @disnake.ui.button(label="⏮️ Previous", style=ButtonStyle.secondary)
+    async def prev(self, _, inter): await inter.response.defer(); await self.bot.play_previous(self.gid)
+    
+    @disnake.ui.button(label="⏯️ Pause/Resume", style=ButtonStyle.success)
+    async def pr(self, _, inter):
+        vc = inter.guild.voice_client
+        if vc: (vc.pause() if vc.is_playing() else vc.resume())
+        await inter.response.defer()
+        
+    @disnake.ui.button(label="⏭️ Skip", style=ButtonStyle.primary)
+    async def skip(self, _, inter): 
+        if inter.guild.voice_client: inter.guild.voice_client.stop()
+        await inter.response.defer()
+
 class VoiceState:
     def __init__(self):
         self.queue = deque()
+        self.history = deque(maxlen=20)
         self.current = None
 
-# --- 4. 機器人核心類別 (使用 Disnake) ---
 class MegaBot(commands.InteractionBot):
     def __init__(self):
-        # Disnake 預設啟用更多底層優化
         super().__init__(intents=disnake.Intents.all())
         self.states: Dict[int, VoiceState] = {}
-        self.request_queue = asyncio.Queue()
-
-    async def get_embedding(self, text):
-        try:
-            r = requests.post(CONFIG["EMBED_API"], json={"texts": [text], "normalize": True}, timeout=3)
-            return r.json()['embeddings'][0]
-        except Exception as e:
-            logger.error(f"Embedding 錯誤: {e}")
-            return None
+        self.req_queue = asyncio.Queue()
 
     async def on_ready(self):
-        if not self.worker_task.is_running():
-            self.worker_task.start()
-        logger.info(f"🚀 Disnake 穩定版已啟動：{self.user}")
+        await services.probe_and_init()
+        if not self.worker.is_running(): self.worker.start()
+        logger.info(f"🚀 MegaBot 2026 核心已啟動 | 模式: 精準音軌與 Zero-Temp LLM")
 
-    async def ensure_voice(self, inter: ApplicationCommandInteraction) -> Optional[disnake.VoiceClient]:
-        """
-        使用 Disnake 內建的 v8 協議處理機制。
-        """
-        if not inter.author.voice:
-            await inter.edit_original_message(content="❌ 你必須先進入語音頻道！")
-            return None
-
-        target_channel = inter.author.voice.channel
-        
-        # 如果已經在其他頻道，先移動過去
-        if inter.guild.voice_client:
-            if inter.guild.voice_client.channel.id != target_channel.id:
-                await inter.guild.voice_client.move_to(target_channel)
-            return inter.guild.voice_client
-
+    async def get_vec(self, text):
         try:
-            logger.info(f"正在嘗試連線至 {target_channel.name}...")
-            # Disnake 處理了 4006 與 IP Discovery Bug，直接 connect 即可
-            vc = await target_channel.connect(timeout=20.0, reconnect=True)
-            return vc
-        except Exception as e:
-            logger.error(f"語音連線失敗: {e}")
-            await inter.edit_original_message(content="⚠️ 語音連線失敗，可能是 Discord 節點問題。")
-            return None
+            r = await asyncio.to_thread(requests.post, CONFIG["EMBED_API"], json={"texts": [text], "normalize": True}, timeout=3)
+            return r.json()['embeddings'][0]
+        except: return None
 
     @tasks.loop(seconds=1)
-    async def worker_task(self):
-        if self.request_queue.empty(): return
-        inter, query = await self.request_queue.get()
+    async def worker(self):
+        if self.req_queue.empty(): return
+        inter, raw_query = await self.req_queue.get()
         gid = inter.guild.id
-        if gid not in self.states: self.states[gid] = VoiceState()
-        
+        state = self.states.setdefault(gid, VoiceState())
+
         try:
-            loop = asyncio.get_event_loop()
-            data = await loop.run_in_executor(None, lambda: services.ytdl.extract_info(f"ytsearch:{query}", download=False))
-            if 'entries' in data: data = data['entries'][0]
+            if raw_query.strip().startswith("http"):
+                target, tag, refined_q = raw_query.strip(), "🔗 網址串流", "Direct Link"
+            else:
+                # LLM 關鍵字優化
+                refine_res = await services.llm.ainvoke([HumanMessage(content=PromptLibrary.get_music_refine_prompt(raw_query))])
+                v = await self.get_vec(raw_query)
+                refined_q = refine_res.content.strip()
+                target, tag = f"ytsearch:{refined_q}", "🔍 AI 搜尋"
+                if v:
+                    hits = services.qdrant.query_points(CONFIG["MUSIC_COL"], query=v, limit=1, score_threshold=0.88).points
+                    if hits: target, tag = hits[0].payload['url'], "💎 記憶匹配"
+
+            data = await self.loop.run_in_executor(None, lambda: services.ytdl.extract_info(target, download=False))
+            entries = data.get('entries', [data]) if 'entries' in data else [data]
             
-            self.states[gid].queue.append(data)
-            vc = inter.guild.voice_client
-            if vc and not vc.is_playing():
+            for entry in entries:
+                if not entry: continue
+                # 生成 DJ 介紹
+                comment_res = await services.llm.ainvoke([HumanMessage(content=PromptLibrary.get_dj_commentary_prompt(entry['title']))])
+                track = {
+                    'title': entry['title'], 
+                    'url': entry['url'], 
+                    'webpage_url': entry.get('webpage_url') or target, 
+                    'dj_words': comment_res.content.strip()
+                }
+                state.queue.append(track)
+                if tag == "🔍 AI 搜尋": asyncio.create_task(self._save_music(raw_query, track))
+
+            if inter.guild.voice_client and not inter.guild.voice_client.is_playing():
                 await self.play_next(gid, inter.channel)
-            await inter.channel.send(f"✅ **{data.get('title')}** 加入隊列")
-        except Exception as e:
-            logger.error(f"解析錯誤: {e}")
-        finally:
-            self.request_queue.task_done()
+            await inter.channel.send(f"📦 **{tag}** 已就緒: `{refined_q}`")
+        except Exception as e: logger.error(f"Worker Error: {e}")
+        finally: self.req_queue.task_done()
 
     async def play_next(self, gid, channel):
-        state = self.states[gid]
-        if not state.queue: return
+        state = self.states.get(gid)
+        if not state or not state.queue: return
         vc = self.get_guild(gid).voice_client
         if not vc: return
-
+        
         track = state.queue.popleft()
+        if state.current: state.history.append(state.current)
+        state.current = track
+
+        source = disnake.FFmpegPCMAudio(track['url'], executable=FFMPEG_PATH, **FFMPEG_OPTS)
+        vc.play(disnake.PCMVolumeTransformer(source, volume=0.8), after=lambda e: self.loop.create_task(self.play_next(gid, channel)))
         
-        try:
-            res = await services.llm.ainvoke([
-                SystemMessage(content="你是專業DJ。用10字內介紹這首歌。"),
-                HumanMessage(content=track.get('title'))
-            ])
-            comment = res.content
-        except: comment = "Enjoy!"
+        embed = Embed(title="📻 MegaBot On Air", description=f"🎵 **{track['title']}**", color=0x5865F2)
+        embed.add_field(name="🎙️ AI DJ Commentary", value=f"*{track['dj_words']}*", inline=False)
+        await channel.send(embed=embed, view=MusicView(self, gid))
 
-        def after_playing(e):
-            if e: logger.error(f"播放異常: {e}")
-            self.loop.create_task(self.play_next(gid, channel))
+    async def play_previous(self, gid):
+        state = self.states.get(gid)
+        if state and state.history:
+            prev = state.history.pop()
+            if state.current: state.queue.appendleft(state.current)
+            state.queue.appendleft(prev)
+            if self.get_guild(gid).voice_client: self.get_guild(gid).voice_client.stop()
 
-        # Disnake 的 FFmpegPCMAudio 參數與 Nextcord 一致
-        audio = disnake.FFmpegPCMAudio(track['url'], executable=CONFIG["FFMPEG"], **FFMPEG_OPTS)
-        vc.play(audio, after=after_playing)
-        
-        await channel.send(embed=Embed(
-            title="🎶 正在播放", 
-            description=f"**{track.get('title')}**\n🎙️ AI DJ: *{comment}*", 
-            color=0x1DB954
-        ))
+    async def _save_music(self, q, t):
+        v = await self.get_vec(f"{q} {t['title']}")
+        if v: services.qdrant.upsert(CONFIG["MUSIC_COL"], points=[models.PointStruct(id=uuid.uuid4().hex, vector=v, payload={"title": t['title'], "url": t['webpage_url']})])
 
-# --- 5. 指令定義 ---
+    async def _save_chat_memory(self, q, a):
+        v = await self.get_vec(f"Q:{q} A:{a}")
+        if v: services.qdrant.upsert(CONFIG["CHAT_COL"], points=[models.PointStruct(id=uuid.uuid4().hex, vector=v, payload={"m": f"Q:{q} A:{a}"})])
+
+# --- 4. 擴充指令集 ---
 bot = MegaBot()
 
-@bot.slash_command(name="play", description="播放 YouTube 音樂")
+@bot.slash_command(name="play", description="播放音樂 (連結或搜尋文字)")
 async def play(inter: ApplicationCommandInteraction, query: str):
     await inter.response.defer()
-    vc = await bot.ensure_voice(inter)
-    if vc:
-        await bot.request_queue.put((inter, query))
-        await inter.edit_original_message(content=f"🔎 搜尋中：`{query}`")
+    if not inter.author.voice: return await inter.edit_original_message(content="❌ 你必須先進入語音頻道")
+    if not inter.guild.voice_client: await inter.author.voice.channel.connect()
+    await bot.req_queue.put((inter, query))
+    await inter.edit_original_message(content=f"🔍 接收請求: `{query[:50]}`")
 
-@bot.slash_command(name="chat", description="AI 對話")
+@bot.slash_command(name="skip", description="跳過當前歌曲")
+async def skip(inter: ApplicationCommandInteraction):
+    if inter.guild.voice_client:
+        inter.guild.voice_client.stop()
+        await inter.response.send_message("⏭️ 已跳過當前歌曲")
+    else: await inter.response.send_message("❌ 目前無播放內容", ephemeral=True)
+
+@bot.slash_command(name="pause", description="暫停播放")
+async def pause(inter: ApplicationCommandInteraction):
+    if inter.guild.voice_client and inter.guild.voice_client.is_playing():
+        inter.guild.voice_client.pause()
+        await inter.response.send_message("⏸️ 已暫停")
+    else: await inter.response.send_message("❌ 無法暫 pause", ephemeral=True)
+
+@bot.slash_command(name="resume", description="恢復播放")
+async def resume(inter: ApplicationCommandInteraction):
+    if inter.guild.voice_client and inter.guild.voice_client.is_paused():
+        inter.guild.voice_client.resume()
+        await inter.response.send_message("▶️ 恢復播放")
+    else: await inter.response.send_message("❌ 音樂並未暫停", ephemeral=True)
+
+@bot.slash_command(name="queue", description="查看待播放隊列")
+async def queue(inter: ApplicationCommandInteraction):
+    state = bot.states.get(inter.guild.id)
+    if not state or not (state.queue or state.current):
+        return await inter.response.send_message("📭 目前隊列空空如也")
+    
+    q_list = "\n".join([f"**{i+1}.** {t['title']}" for i, t in enumerate(list(state.queue)[:10])])
+    embed = Embed(title="📜 播放隊列", color=0x2ECC71)
+    embed.add_field(name="Now Playing", value=state.current['title'], inline=False)
+    embed.add_field(name="Up Next", value=q_list or "無後續歌曲", inline=False)
+    await inter.response.send_message(embed=embed)
+
+@bot.slash_command(name="history", description="查看最近播放紀錄")
+async def history(inter: ApplicationCommandInteraction):
+    state = bot.states.get(inter.guild.id)
+    if not state or not state.history:
+        return await inter.response.send_message("📜 尚無播放紀錄")
+    h_list = "\n".join([f"• {t['title']}" for t in reversed(list(state.history))])
+    await inter.response.send_message(embed=Embed(title="🕒 播放歷史", description=h_list, color=0x95A5A6))
+
+@bot.slash_command(name="stop", description="停止播放並清空隊列")
+async def stop(inter: ApplicationCommandInteraction):
+    state = bot.states.get(inter.guild.id)
+    if state: state.queue.clear()
+    if inter.guild.voice_client:
+        await inter.guild.voice_client.disconnect()
+        await inter.response.send_message("⏹️ 停止播放並離開頻道")
+
+@bot.slash_command(name="chat", description="AI 對話模式")
 async def chat(inter: ApplicationCommandInteraction, message: str):
     await inter.response.defer()
-    res = await services.llm.ainvoke([
-        SystemMessage(content="你是具備記憶的助手。"),
-        HumanMessage(content=message)
-    ])
+    v = await bot.get_vec(message)
+    context = ""
+    if v:
+        hits = services.qdrant.query_points(CONFIG["CHAT_COL"], query=v, limit=3).points
+        context = "\n".join([h.payload['m'] for h in hits])
+    res = await services.llm.ainvoke([SystemMessage(content=PromptLibrary.get_chat_system_prompt(context)), HumanMessage(content=message)])
     await inter.edit_original_message(content=f"🤖 | {res.content}")
-
-    async def _save():
-        v = await bot.get_embedding(f"Q:{message} A:{res.content}")
-        if v:
-            services.qdrant.upsert(
-                CONFIG["MEMORY_COLLECTION"], 
-                points=[models.PointStruct(id=uuid.uuid4().hex, vector=v, payload={"m": f"Q:{message} A:{res.content}"})]
-            )
-    asyncio.create_task(_save())
+    asyncio.create_task(bot._save_chat_memory(message, res.content))
 
 if __name__ == "__main__":
     bot.run(CONFIG["TOKEN"])
