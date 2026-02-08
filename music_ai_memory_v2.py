@@ -1,4 +1,6 @@
 import os
+import re
+import urllib.parse
 import asyncio
 import logging
 import uuid
@@ -18,6 +20,7 @@ from yt_dlp import YoutubeDL
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 # --- 0. 配置與初始化 ---
 load_dotenv()
@@ -30,17 +33,22 @@ FFMPEG_PATH = shutil.which(os.getenv('FFMPEG_PATH', 'ffmpeg')) or 'ffmpeg'
 CONFIG = {
     "TOKEN": os.getenv('DISCORD_BOT_TOKEN'),
     "QDRANT": os.getenv('QDRANT_URL', "http://localhost:6333"),
-    "EMBED_API": "https://ws-04.wade0426.me/embed",
-    "LLM_API": "https://ws-02.wade0426.me/v1",
+    "EMBED_API": os.getenv('EMBED_API'),
+    "LLM_API": os.getenv('LLM_API'),
     "CHAT_COL": "mega_chat_v2026",
     "MUSIC_COL": "mega_music_v2026"
 }
 
-# 強制選取第一條流 (-map 0:a:0) 確保原始音訊輸出
 FFMPEG_OPTS = {
     'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -probesize 10M -analyzeduration 10M',
     'options': '-vn -loglevel panic -map 0:a:0',
 }
+
+text_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=600,
+    chunk_overlap=60,
+    separators=["\n\n", "\n", "。", "！", "？", " ", ""]
+)
 
 # --- 1. 精確化提示詞庫 ---
 class PromptLibrary:
@@ -62,12 +70,18 @@ class PromptLibrary:
     def get_chat_system_prompt(context: str):
         return f"""[ROLE] MegaBot 2026 AI.
 [CONTEXT] {context}
-[INSTRUCTION] Answer concisely based on memory. Be professional yet witty."""
+[INSTRUCTION] 
+1. Answer concisely and wittily based on memory.
+2. Provide a DIRECT, CLICKABLE URL related to the topic:
+   - If it's a YouTuber/Creator, provide their YouTube channel link.
+   - If it's a product, provide a Shopee search link: https://shopee.tw/search?keyword=[KEYWORD]
+   - If it's a general topic/person, provide a Wikipedia or Official site link.
+3. IMPORTANT: Output the URL as RAW plain text (NO Markdown like [text](url)).
+4. DO NOT provide a shopping link if the topic is not a product."""
 
 # --- 2. 服務管理員 ---
 class ServiceManager:
     def __init__(self):
-        # 音軌邏輯：移除特定語言偏好，改為 format_sort 優先原始音軌
         self.ytdl = YoutubeDL({
             'format': 'bestaudio/best',
             'quiet': True,
@@ -76,11 +90,10 @@ class ServiceManager:
             'extract_flat': False,
             'nocheckcertificate': True,
             'ignoreerrors': True,
-            'format_sort': ['hasaud', 'ext', 'downloader_key'], # 優先考慮原始串流品質
+            'format_sort': ['hasaud', 'ext', 'downloader_key'],
         })
         self.qdrant = QdrantClient(url=CONFIG["QDRANT"])
         
-        # LLM 設定改為指定格式，temperature 設為 0
         self.llm = ChatOpenAI(
             base_url=CONFIG["LLM_API"], 
             api_key="none", 
@@ -140,7 +153,7 @@ class MegaBot(commands.InteractionBot):
     async def on_ready(self):
         await services.probe_and_init()
         if not self.worker.is_running(): self.worker.start()
-        logger.info(f"🚀 MegaBot 2026 核心已啟動 | 模式: 精準音軌與 Zero-Temp LLM")
+        logger.info(f"🚀 MegaBot 2026 核心啟動 | 全領域智慧連結模式")
 
     async def get_vec(self, text):
         try:
@@ -159,7 +172,6 @@ class MegaBot(commands.InteractionBot):
             if raw_query.strip().startswith("http"):
                 target, tag, refined_q = raw_query.strip(), "🔗 網址串流", "Direct Link"
             else:
-                # LLM 關鍵字優化
                 refine_res = await services.llm.ainvoke([HumanMessage(content=PromptLibrary.get_music_refine_prompt(raw_query))])
                 v = await self.get_vec(raw_query)
                 refined_q = refine_res.content.strip()
@@ -173,7 +185,6 @@ class MegaBot(commands.InteractionBot):
             
             for entry in entries:
                 if not entry: continue
-                # 生成 DJ 介紹
                 comment_res = await services.llm.ainvoke([HumanMessage(content=PromptLibrary.get_dj_commentary_prompt(entry['title']))])
                 track = {
                     'title': entry['title'], 
@@ -220,10 +231,21 @@ class MegaBot(commands.InteractionBot):
         if v: services.qdrant.upsert(CONFIG["MUSIC_COL"], points=[models.PointStruct(id=uuid.uuid4().hex, vector=v, payload={"title": t['title'], "url": t['webpage_url']})])
 
     async def _save_chat_memory(self, q, a):
-        v = await self.get_vec(f"Q:{q} A:{a}")
-        if v: services.qdrant.upsert(CONFIG["CHAT_COL"], points=[models.PointStruct(id=uuid.uuid4().hex, vector=v, payload={"m": f"Q:{q} A:{a}"})])
+        combined_text = f"Q:{q} A:{a}"
+        chunks = text_splitter.split_text(combined_text)
+        points = []
+        for chunk in chunks:
+            v = await self.get_vec(chunk)
+            if v:
+                points.append(models.PointStruct(
+                    id=uuid.uuid4().hex, 
+                    vector=v, 
+                    payload={"m": chunk}
+                ))
+        if points:
+            services.qdrant.upsert(CONFIG["CHAT_COL"], points=points)
 
-# --- 4. 擴充指令集 ---
+# --- 4. 指令集 ---
 bot = MegaBot()
 
 @bot.slash_command(name="play", description="播放音樂 (連結或搜尋文字)")
@@ -246,7 +268,7 @@ async def pause(inter: ApplicationCommandInteraction):
     if inter.guild.voice_client and inter.guild.voice_client.is_playing():
         inter.guild.voice_client.pause()
         await inter.response.send_message("⏸️ 已暫停")
-    else: await inter.response.send_message("❌ 無法暫 pause", ephemeral=True)
+    else: await inter.response.send_message("❌ 無法暫停", ephemeral=True)
 
 @bot.slash_command(name="resume", description="恢復播放")
 async def resume(inter: ApplicationCommandInteraction):
@@ -260,7 +282,6 @@ async def queue(inter: ApplicationCommandInteraction):
     state = bot.states.get(inter.guild.id)
     if not state or not (state.queue or state.current):
         return await inter.response.send_message("📭 目前隊列空空如也")
-    
     q_list = "\n".join([f"**{i+1}.** {t['title']}" for i, t in enumerate(list(state.queue)[:10])])
     embed = Embed(title="📜 播放隊列", color=0x2ECC71)
     embed.add_field(name="Now Playing", value=state.current['title'], inline=False)
@@ -283,16 +304,40 @@ async def stop(inter: ApplicationCommandInteraction):
         await inter.guild.voice_client.disconnect()
         await inter.response.send_message("⏹️ 停止播放並離開頻道")
 
-@bot.slash_command(name="chat", description="AI 對話模式")
+@bot.slash_command(name="chat", description="AI 對話模式 (全領域連結導航)")
 async def chat(inter: ApplicationCommandInteraction, message: str):
     await inter.response.defer()
     v = await bot.get_vec(message)
     context = ""
     if v:
-        hits = services.qdrant.query_points(CONFIG["CHAT_COL"], query=v, limit=3).points
+        hits = services.qdrant.query_points(CONFIG["CHAT_COL"], query=v, limit=5).points
         context = "\n".join([h.payload['m'] for h in hits])
-    res = await services.llm.ainvoke([SystemMessage(content=PromptLibrary.get_chat_system_prompt(context)), HumanMessage(content=message)])
-    await inter.edit_original_message(content=f"🤖 | {res.content}")
+    
+    res = await services.llm.ainvoke([
+        SystemMessage(content=PromptLibrary.get_chat_system_prompt(context)), 
+        HumanMessage(content=message)
+    ])
+    
+    reply = res.content
+    # 🔍 正則表達式抓取所有網址
+    found_urls = re.findall(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\(\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', reply)
+    
+    for url in found_urls:
+        try:
+            # 確保網址中的中文與特殊字元被編碼，這能解決 Discord 無法點擊的問題
+            parsed = urllib.parse.urlparse(url)
+            # 編碼 Path 與 Query
+            safe_path = urllib.parse.quote(parsed.path)
+            safe_query = urllib.parse.quote(parsed.query, safe='=&')
+            
+            safe_url = urllib.parse.urlunparse(
+                parsed._replace(path=safe_path, query=safe_query)
+            )
+            reply = reply.replace(url, safe_url)
+        except:
+            continue
+
+    await inter.edit_original_message(content=f"🤖 | {reply}")
     asyncio.create_task(bot._save_chat_memory(message, res.content))
 
 if __name__ == "__main__":
